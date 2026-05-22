@@ -1,7 +1,8 @@
-import React, { useState } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { 
   Upload, RefreshCw, FileText, Download, Copy, Check, Instagram, Image as ImageIcon, 
-  Sparkles, Video, Compass, ChevronRight, ChevronLeft, Layers, Send, HelpCircle, ArrowRight
+  Sparkles, Video, Compass, ChevronRight, ChevronLeft, Layers, Send, HelpCircle, ArrowRight,
+  Play, Pause, Volume2, RotateCcw, Clapperboard, Sliders, Music, Film, Headphones
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -35,9 +36,31 @@ export default function App() {
   const [isGeneratingScript, setIsGeneratingScript] = useState(false);
   const [generatedScript, setGeneratedScript] = useState<ScriptResponse | null>(null);
   const [activeSlideIndex, setActiveSlideIndex] = useState(0);
+
+  // Text-To-Speech & Video Simulation states
+  const [selectedVoice, setSelectedVoice] = useState("Kore"); // Kore, Zephyr, Puck, Fenrir, Charon
+  const [slideImages, setSlideImages] = useState<Record<number, string>>({});
+  const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({});
+  const [isTtsLoading, setIsTtsLoading] = useState<Record<number, boolean>>({});
+  const [slideAudio, setSlideAudio] = useState<Record<number, string>>({});
+  const [currentlyPlayingIndex, setCurrentlyPlayingIndex] = useState<number | null>(null);
+  const [isPlayingVideo, setIsPlayingVideo] = useState(false);
+  const [isFallbackSpeech, setIsFallbackSpeech] = useState(false); // Tells the UI when Web Speech API is speaking
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   
   // Feedback alerts
   const [copiedText, setCopiedText] = useState<string | null>(null);
+
+  // Cleanup synthesizer actions on element unmount
+  useEffect(() => {
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+      window.speechSynthesis.cancel();
+    };
+  }, []);
 
   // Helper to trigger transient alerts
   const triggerCopyAlert = (text: string, label: string) => {
@@ -174,6 +197,201 @@ export default function App() {
     }
   };
 
+  // Speak text using Web Speech API as a high-fidelity local fallback
+  const speakWithSpeechSynthesis = (text: string, onEnded: () => void) => {
+    window.speechSynthesis.cancel();
+    setIsFallbackSpeech(true);
+    
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.15; // Quick pace suitable for Shorts/Reels
+    utterance.pitch = 1.0;
+    
+    // Choose standard natural English voice
+    let voices = window.speechSynthesis.getVoices();
+    const preferredVoice = voices.find(v => 
+      v.lang.startsWith("en-") && 
+      (v.name.includes("Natural") || v.name.includes("Google") || v.name.includes("Apple"))
+    ) || voices.find(v => v.lang.startsWith("en-"));
+
+    if (preferredVoice) utterance.voice = preferredVoice;
+
+    utterance.onend = () => {
+      setIsFallbackSpeech(false);
+      onEnded();
+    };
+
+    utterance.onerror = () => {
+      setIsFallbackSpeech(false);
+      onEnded();
+    };
+
+    window.speechSynthesis.speak(utterance);
+  };
+
+  // Play slide voiceover using Gemini TTS (with natural Web Speech fallback)
+  const playSlideAudio = async (index: number, autoAdvance: boolean = false) => {
+    if (!generatedScript) return;
+    const slide = generatedScript.slides[index];
+    if (!slide) return;
+
+    // Flush any ongoing vocal playback
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    window.speechSynthesis.cancel();
+    setIsFallbackSpeech(false);
+
+    setCurrentlyPlayingIndex(index);
+
+    const triggerAudioElement = (srcStr: string) => {
+      const audio = new Audio(srcStr);
+      audioRef.current = audio;
+      
+      audio.onended = () => {
+        setCurrentlyPlayingIndex(null);
+        if (autoAdvance && isPlayingVideo) {
+          if (index < generatedScript.slides.length - 1) {
+            setActiveSlideIndex(index + 1);
+            playSlideAudio(index + 1, true);
+          } else {
+            setIsPlayingVideo(false);
+          }
+        }
+      };
+
+      audio.onerror = () => {
+        console.warn(">> Selected audio failed to decode or load. Triggering local SpeechSynthesis fallback.");
+        speakWithSpeechSynthesis(slide.voiceoverText, () => {
+          setCurrentlyPlayingIndex(null);
+          if (autoAdvance && isPlayingVideo) {
+            if (index < generatedScript.slides.length - 1) {
+              setActiveSlideIndex(index + 1);
+              playSlideAudio(index + 1, true);
+            } else {
+              setIsPlayingVideo(false);
+            }
+          }
+        });
+      };
+
+      audio.play().catch(e => {
+        console.warn("Autoplay was blocked by browser. Handled gracefully.", e);
+        setCurrentlyPlayingIndex(null);
+        setIsPlayingVideo(false);
+      });
+    };
+
+    // Voice Cache Lookup
+    const cacheKey = `${index}-${selectedVoice}`;
+    if (slideAudio[cacheKey]) {
+      triggerAudioElement(slideAudio[cacheKey]);
+      return;
+    }
+
+    setIsTtsLoading(prev => ({ ...prev, [index]: true }));
+
+    try {
+      const res = await fetch("/api/generate-tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: slide.voiceoverText,
+          voiceName: selectedVoice
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error("TTS Route Failed");
+      }
+
+      const data = await res.json();
+      if (data.useFallbackSpeechSynthesis) {
+        speakWithSpeechSynthesis(slide.voiceoverText, () => {
+          setCurrentlyPlayingIndex(null);
+          if (autoAdvance && isPlayingVideo) {
+            if (index < generatedScript.slides.length - 1) {
+              setActiveSlideIndex(index + 1);
+              playSlideAudio(index + 1, true);
+            } else {
+              setIsPlayingVideo(false);
+            }
+          }
+        });
+      } else if (data.audio) {
+        const dataUrl = `data:audio/mp3;base64,${data.audio}`;
+        setSlideAudio(prev => ({ ...prev, [cacheKey]: dataUrl }));
+        triggerAudioElement(dataUrl);
+      } else {
+        throw new Error("No audio payload received");
+      }
+    } catch (err) {
+      console.warn(">> TTS API service issue, loading browser fallback synthesis:", err);
+      speakWithSpeechSynthesis(slide.voiceoverText, () => {
+        setCurrentlyPlayingIndex(null);
+        if (autoAdvance && isPlayingVideo) {
+          if (index < generatedScript.slides.length - 1) {
+            setActiveSlideIndex(index + 1);
+            playSlideAudio(index + 1, true);
+          } else {
+            setIsPlayingVideo(false);
+          }
+        }
+      });
+    } finally {
+      setIsTtsLoading(prev => ({ ...prev, [index]: false }));
+    }
+  };
+
+  // Generate 9:16 specific AI slide background artwork from prompt
+  const generateSlideImage = async (index: number) => {
+    if (!generatedScript) return;
+    const slide = generatedScript.slides[index];
+    if (!slide) return;
+
+    setIsGeneratingImage(prev => ({ ...prev, [index]: true }));
+
+    try {
+      const res = await fetch("/api/generate-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: slide.visualPrompt })
+      });
+
+      if (!res.ok) {
+        throw new Error("Artwork service errored.");
+      }
+
+      const data = await res.json();
+      if (data.imageUrl) {
+        setSlideImages(prev => ({ ...prev, [index]: data.imageUrl }));
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Failed to generate custom backdrop. Choosing a stock aesthetic photo.");
+    } finally {
+      setIsGeneratingImage(prev => ({ ...prev, [index]: false }));
+    }
+  };
+
+  const startFullVideoAutoplay = () => {
+    if (!generatedScript || generatedScript.slides.length === 0) return;
+    setIsPlayingVideo(true);
+    setActiveSlideIndex(0);
+    playSlideAudio(0, true);
+  };
+
+  const stopVideoAutoplay = () => {
+    setIsPlayingVideo(false);
+    setCurrentlyPlayingIndex(null);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    window.speechSynthesis.cancel();
+    setIsFallbackSpeech(false);
+  };
+
   const clearAll = () => {
     setInstagramUrl("");
     setManualPostText("");
@@ -182,7 +400,20 @@ export default function App() {
     setUploadedImages([]);
     setGeneratedScript(null);
     setCustomGoal("Inspiring, modern, and high-tempo");
+    setSlideImages({});
+    setSlideAudio({});
+    setSelectedVoice("Kore");
+    setIsPlayingVideo(false);
+    setCurrentlyPlayingIndex(null);
+    setIsFallbackSpeech(false);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    window.speechSynthesis.cancel();
   };
+
+  const [studioTab, setStudioTab] = useState<"player" | "planner">("player");
 
   return (
     <div className="min-h-screen bg-[#FBFBFC] text-[#1E2022] flex flex-col antialiased font-sans">
@@ -380,21 +611,26 @@ export default function App() {
 
           </div>
 
-          {/* RIGHT SECTION: Screen Display & Interactive Storyboard (7 Cols) */}
+          {/* RIGHT SECTION: Studio Preview & Interactive Storyboard (7 Cols) */}
           <div className="lg:col-span-7 space-y-6">
             
-            {/* STEP 1 outcome: Visual preview of photo */}
+            {/* Downloaded Original Post Image Drawer */}
             <div className="bg-white border border-gray-200 rounded-2xl p-6 shadow-xs">
               <div className="flex justify-between items-center mb-4">
-                <h3 className="text-xs font-bold uppercase tracking-wider text-gray-500 font-mono flex items-center gap-2">
-                  <ImageIcon className="w-4 h-4 text-purple-600" />
-                  <span>Downloaded Post Image</span>
-                </h3>
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-pink-50 text-pink-600">
+                    <ImageIcon className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-bold uppercase tracking-wider text-gray-500 font-mono">Original Post Source Image</h4>
+                    <p className="text-[10px] text-gray-400">Extracted and parsed via multimodal OCR</p>
+                  </div>
+                </div>
                 {downloadedImageUrl && (
                   <a 
                     href={downloadedImageUrl} 
                     download="instagram-image-source.jpg"
-                    className="text-xs font-bold text-emerald-600 hover:text-emerald-700 bg-emerald-50 px-3 py-1.5 rounded-lg border border-emerald-100 flex items-center gap-1 shadow-2xs transition"
+                    className="text-xs font-bold text-gray-650 hover:text-black bg-gray-50 hover:bg-gray-100 px-3 py-1.5 rounded-lg border border-gray-200 flex items-center gap-x-1 transition"
                   >
                     <Download className="w-3.5 h-3.5" />
                     <span>Save Photo</span>
@@ -403,159 +639,525 @@ export default function App() {
               </div>
 
               {downloadedImageUrl ? (
-                <div className="relative rounded-xl overflow-hidden bg-gray-900 border border-gray-150 flex items-center justify-center max-h-[350px]">
+                <div className="relative rounded-xl overflow-hidden bg-gray-900 border border-gray-155 flex items-center justify-center max-h-[220px]">
                   <img 
                     src={downloadedImageUrl} 
                     alt="Instagram Post Attachment" 
-                    className="max-h-[350px] w-auto object-contain"
+                    className="max-h-[220px] w-auto object-contain"
                     referrerPolicy="no-referrer"
                   />
-                  <div className="absolute top-2 left-2 bg-black/60 backdrop-blur-xs text-[10px] text-white px-2 py-0.5 rounded font-mono font-bold tracking-wide">
-                    Extracted Photo Source
+                  <div className="absolute top-2 left-2 bg-black/60 backdrop-blur-xs text-[9px] text-white px-2 py-0.5 rounded font-mono font-bold tracking-wide">
+                    Instagram Post Frame
                   </div>
                 </div>
               ) : (
-                <div className="border border-dashed border-gray-200 rounded-xl p-10 text-center text-gray-400 bg-[#FAFAFA]">
-                  <ImageIcon className="w-8 h-8 mx-auto text-gray-300 mb-2" />
-                  <p className="text-xs font-semibold">Ready to display original photography</p>
-                  <p className="text-[10px] text-gray-400 mt-1">Image file will render here after successful scrapers or manual screenshot upload.</p>
+                <div className="border border-dashed border-gray-200 rounded-xl p-6 text-center text-gray-400 bg-[#FAFAFA]">
+                  <ImageIcon className="w-6 h-6 mx-auto text-gray-300 mb-1" />
+                  <p className="text-xs font-semibold">No screenshot or photo has been loaded</p>
+                  <p className="text-[10px] text-gray-400">Image will appear here after parsing in Step 1.</p>
                 </div>
               )}
             </div>
 
-            {/* STEP 2 outcome: Interactive Storyboard Script */}
-            <div className="bg-white border border-gray-200 rounded-2xl p-6 shadow-xs flex flex-col min-h-[460px]">
+            {/* MAIN CREATOR STUDIO BOARD */}
+            <div className="bg-white border border-gray-200 rounded-2xl shadow-xs overflow-hidden flex flex-col min-h-[580px]">
               
-              <div className="border-b border-gray-100 pb-4 mb-6">
-                <span className="text-[10px] font-bold text-[#F56040] uppercase tracking-widest font-mono block mb-1">Interactive Storyboard</span>
-                <h3 className="text-base font-extrabold text-gray-900 flex items-center gap-2">
-                  <span>YouTube Short/Reel Script View</span>
-                </h3>
+              {/* Studio Header & Tab Switching */}
+              <div className="bg-gradient-to-b from-[#FAF9FA] to-white border-b border-gray-150 p-6 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+                <div>
+                  <span className="text-[10px] font-bold text-[#833AB4] uppercase tracking-widest font-mono block mb-0.5">Short-Form Studio</span>
+                  <h3 className="text-lg font-extrabold text-[#1E2022] flex items-center gap-2">
+                    <Clapperboard className="w-5 h-5 text-[#F56040]" />
+                    <span>Video Developer Playground</span>
+                  </h3>
+                </div>
+
+                {generatedScript && (
+                  <div className="flex bg-gray-100 rounded-xl p-1 border border-gray-200/80 w-full sm:w-auto">
+                    <button
+                      onClick={() => {
+                        stopVideoAutoplay();
+                        setStudioTab("player");
+                      }}
+                      className={`flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold transition select-none cursor-pointer outline-none ${
+                        studioTab === "player" 
+                          ? "bg-white text-[#833AB4] shadow-xs border border-purple-100" 
+                          : "text-gray-500 hover:text-black"
+                      }`}
+                    >
+                      <Play className="w-3.5 h-3.5" />
+                      <span>Live 9:16 Video Player</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        stopVideoAutoplay();
+                        setStudioTab("planner");
+                      }}
+                      className={`flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold transition select-none cursor-pointer outline-none ${
+                        studioTab === "planner" 
+                          ? "bg-white text-[#833AB4] shadow-xs border border-purple-100" 
+                          : "text-gray-500 hover:text-black"
+                      }`}
+                    >
+                      <Sliders className="w-3.5 h-3.5" />
+                      <span>Storyboard Scenes</span>
+                    </button>
+                  </div>
+                )}
               </div>
 
               {!generatedScript ? (
-                <div className="flex-1 flex flex-col items-center justify-center text-center p-8 border border-dashed border-gray-150 rounded-xl bg-gray-50/50">
-                  <div className="bg-gray-100/80 p-3.5 rounded-full text-gray-400 mb-4">
-                    <Layers className="w-6 h-6" />
+                // Empty state
+                <div className="flex-grow flex flex-col items-center justify-center text-center p-12 bg-[#FAFBFC]">
+                  <div className="bg-gray-100 p-4 rounded-full text-gray-400 mb-4">
+                    <Video className="w-8 h-8 text-neutral-450" />
                   </div>
-                  <h4 className="font-bold text-gray-700 text-sm mb-1">No video script built yet</h4>
+                  <h4 className="font-extrabold text-gray-700 text-sm mb-1">Storyboard studio is offline</h4>
                   <p className="text-xs text-gray-400 max-w-sm leading-relaxed">
-                    Once the visual text is extracted from the image in Step 1, click "Create Video Script" to construct a slide-by-slide vertical storyboard.
+                    Extract visual information from your original image in Step 1, configure script tone, and click "Create Video Script". The interactive shorts engine will boot automatically.
                   </p>
                 </div>
               ) : (
-                <div className="space-y-6 flex-grow flex flex-col justify-between">
+                <div className="flex-grow p-6 flex flex-col justify-between bg-gray-50/20">
                   
-                  {/* Title & SEO Description */}
-                  <div className="bg-gradient-to-r from-purple-50 to-pink-50 p-4 rounded-xl border border-purple-100/50">
-                    <div className="flex justify-between items-start mb-2">
-                      <span className="text-[10px] font-bold tracking-wider uppercase text-purple-600 font-mono">Suggested Video Title & Details</span>
-                      <button 
-                        onClick={() => triggerCopyAlert(`${generatedScript.title}\n\n${generatedScript.description}`, "seo")}
-                        className="text-[10px] text-purple-600 font-bold flex items-center gap-1 hover:underline"
-                      >
-                        {copiedText === "seo" ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
-                        <span>{copiedText === "seo" ? "Copied" : "Copy Info"}</span>
-                      </button>
-                    </div>
-                    <h4 className="font-extrabold text-sm text-gray-900 mb-1">
-                      {generatedScript.title}
-                    </h4>
-                    <p className="text-[11px] text-gray-500 italic block leading-relaxed line-clamp-2">
-                      {generatedScript.description}
-                    </p>
-                  </div>
-
-                  {/* Dynamic Slide presentation */}
-                  <div className="border border-gray-200 rounded-xl p-5 bg-gray-50/60 relative flex-grow my-2">
-                    
-                    {/* Header bar of slide */}
-                    <div className="flex justify-between items-center text-xs font-mono font-bold text-gray-450 border-b border-gray-150 pb-2 mb-4">
-                      <span>SCENE {activeSlideIndex + 1} of {generatedScript.slides.length}</span>
-                      <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded-full text-[10px]">
-                        ⏰ {generatedScript.slides[activeSlideIndex].durationSec}s
-                      </span>
-                    </div>
-
-                    <div className="space-y-4">
+                  {/* Tab 1: Live Interactive Phone Simulator */}
+                  {studioTab === "player" && (
+                    <div className="space-y-6 flex-grow flex flex-col justify-between">
                       
-                      {/* Screen Caption Preview */}
-                      <div className="space-y-1">
-                        <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide">Caption Overlay (on screen)</span>
-                        <div className="bg-black text-yellow-300 font-extrabold text-center text-sm py-2 px-4 rounded-lg uppercase tracking-wide shadow-xs font-sans">
-                          "{generatedScript.slides[activeSlideIndex].captionText}"
+                      {/* Sub-Header with Active Scene info */}
+                      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 pb-4 border-b border-gray-100">
+                        <div>
+                          <span className="text-xs font-bold font-mono text-[#833AB4]">Voice Selection & Playback:</span>
+                          <span className="text-xs text-gray-400 ml-1">Prebuilt high-fidelity Gemini neural voices.</span>
+                        </div>
+                        {/* Status notification bar */}
+                        {currentlyPlayingIndex !== null && (
+                          <div className="flex items-center gap-2 bg-emerald-50 text-emerald-700 border border-emerald-100 px-2.5 py-1 rounded-full text-[10px] font-mono font-bold">
+                            <span className="relative flex h-2 w-2">
+                              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                            </span>
+                            <span>{isFallbackSpeech ? "WEB SPEECH FALLBACK VOICE" : `GEMINI VOICE: ${selectedVoice}`}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Phone simulator layout panel */}
+                      <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center">
+                        
+                        {/* COLUMN A: Smartphone viewport */}
+                        <div className="md:col-span-6 flex justify-center">
+                          <div className="relative w-full max-w-[270px] h-[480px] bg-black text-white overflow-hidden rounded-[40px] border-[10px] border-gray-900 shadow-2xl select-none">
+                            {/* Camera notch */}
+                            <div className="absolute top-2.5 left-1/2 -translate-y-1/2 -translate-x-1/2 w-24 h-5 bg-black rounded-full z-20 flex items-center justify-center gap-1.5 px-3">
+                              <div className="w-1.5 h-1.5 rounded-full bg-[#1F2937]"></div>
+                              <div className="w-7 h-1 bg-[#1F2937] rounded-full"></div>
+                              <div className="w-1.5 h-1.5 rounded-full bg-[#1F2937]"></div>
+                            </div>
+
+                            {/* Active segment indicators at top */}
+                            <div className="absolute top-5 left-4 right-4 z-20 flex gap-1">
+                              {generatedScript.slides.map((_, i) => (
+                                <div 
+                                  key={i} 
+                                  className={`h-1 flex-1 rounded-full transition-all ${
+                                    i === activeSlideIndex 
+                                      ? "bg-[#FCAF45]" 
+                                      : i < activeSlideIndex 
+                                      ? "bg-white" 
+                                      : "bg-white/30"
+                                  }`}
+                                />
+                              ))}
+                            </div>
+
+                            {/* Scene text bubble floating top-left */}
+                            <div className="absolute top-8 left-4 z-20 bg-black/60 backdrop-blur-xs px-2 py-0.5 rounded-md text-[10px] font-bold font-mono tracking-wide text-gray-200">
+                              Scene {activeSlideIndex + 1} • {generatedScript.slides[activeSlideIndex].durationSec}s
+                            </div>
+
+                            {/* Slide image backdrop renderer */}
+                            <div className="absolute inset-0 bg-neutral-950 flex items-center justify-center">
+                              {slideImages[activeSlideIndex] ? (
+                                <img 
+                                  src={slideImages[activeSlideIndex]} 
+                                  alt="Slide Scene Artwork" 
+                                  className="w-full h-full object-cover"
+                                  referrerPolicy="no-referrer"
+                                />
+                              ) : downloadedImageUrl ? (
+                                <div className="w-full h-full relative">
+                                  <img 
+                                    src={downloadedImageUrl} 
+                                    alt="Fallback Source BG" 
+                                    className="w-full h-full object-cover opacity-35 blur-xs scale-105"
+                                    referrerPolicy="no-referrer"
+                                  />
+                                  <div className="absolute inset-0 flex flex-col justify-center items-center text-center p-4">
+                                    <Video className="w-8 h-8 text-white/50 mb-2" />
+                                    <p className="text-[10px] text-gray-300 font-bold uppercase tracking-wider">Default Backing Track</p>
+                                    <p className="text-[9px] text-gray-450 mt-1 max-w-[160px]">Click 'AI Artwork' to paint image backdrop matching this scene prompt with Gemini.</p>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="w-full h-full bg-gradient-to-b from-neutral-900 to-neutral-800 flex flex-col items-center justify-center text-center p-4">
+                                  <Compass className="w-8 h-8 text-white/20 mb-2" />
+                                  <p className="text-[10px] text-neutral-400 font-mono">Ambient backdrop placeholder</p>
+                                </div>
+                              )}
+
+                              {/* Soft dark vignette overlays */}
+                              <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-black/45 z-10 pointer-events-none" />
+                            </div>
+
+                            {/* Reels Styled Big Interactive Subtitles Overlay in lower-third */}
+                            <div className="absolute bottom-16 left-3 right-3 text-center z-10 px-1 pointer-events-none leading-snug">
+                              <AnimatePresence mode="wait">
+                                <motion.div 
+                                  key={activeSlideIndex}
+                                  initial={{ opacity: 0, scale: 0.95 }}
+                                  animate={{ opacity: 1, scale: 1 }}
+                                  exit={{ opacity: 0, scale: 1.05 }}
+                                  transition={{ duration: 0.16 }}
+                                  className="inline-block bg-yellow-300 text-black font-extrabold text-[12px] md:text-[13px] py-1.5 px-3.5 uppercase tracking-wide rounded-lg leading-tight border-2 border-black shadow-lg shadow-black/80 whitespace-normal break-words"
+                                >
+                                  "{generatedScript.slides[activeSlideIndex].captionText}"
+                                </motion.div>
+                              </AnimatePresence>
+                            </div>
+
+                            {/* CSS Animated Audio spectrum visualization floating right */}
+                            {currentlyPlayingIndex === activeSlideIndex && (
+                              <div className="absolute bottom-4 right-4 z-20 flex gap-0.5 items-end justify-center h-5 w-6 bg-black/50 backdrop-blur-xs rounded-md px-1.5 py-1">
+                                <div className="w-0.5 bg-[#833AB4] rounded-t animate-pulse" style={{ height: '70%', animationDelay: '0.1s', animationDuration: '0.5s' }}></div>
+                                <div className="w-0.5 bg-[#F56040] rounded-t animate-pulse" style={{ height: '90%', animationDelay: '0.2s', animationDuration: '0.3s' }}></div>
+                                <div className="w-0.5 bg-[#FCAF45] rounded-t animate-pulse" style={{ height: '50%', animationDelay: '0.3s', animationDuration: '0.6s' }}></div>
+                              </div>
+                            )}
+
+                            {/* Floating Generate Slide Image button on top layer of phone */}
+                            <button
+                              title="Generate customized AI backdrop matching this scene prompt"
+                              disabled={isGeneratingImage[activeSlideIndex]}
+                              onClick={() => generateSlideImage(activeSlideIndex)}
+                              className="absolute bottom-4 left-4 z-20 bg-white/10 hover:bg-white/20 text-white rounded-full p-2 backdrop-blur-md shadow-xs active:scale-95 transition disabled:opacity-40 cursor-pointer border-none"
+                            >
+                              {isGeneratingImage[activeSlideIndex] ? (
+                                <RefreshCw className="w-3.5 h-3.5 animate-spin text-purple-200" />
+                              ) : (
+                                <Sparkles className="w-3.5 h-3.5 text-[#FCAF45] animate-pulse" />
+                              )}
+                            </button>
+                            
+                          </div>
+                        </div>
+
+                        {/* COLUMN B: Simulator Controls, voice configuration, active sliders */}
+                        <div className="md:col-span-6 space-y-4">
+                          
+                          {/* 1. Voice Selector Block */}
+                          <div className="space-y-2">
+                            <span className="block text-[11px] font-bold text-gray-400 uppercase tracking-widest font-mono">Gemini AI Model Voice</span>
+                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-1.5">
+                              {[
+                                { name: "Kore", label: "♀ Kore", desc: "Clear Female" },
+                                { name: "Zephyr", label: "♀ Zephyr", desc: "Cheerful" },
+                                { name: "Puck", label: "♂ Puck", desc: "Warm Male" },
+                                { name: "Fenrir", label: "♂ Fenrir", desc: "Energetic" },
+                                { name: "Charon", label: "♂ Charon", desc: "Serious Male" }
+                              ].map((v) => (
+                                <button
+                                  key={v.name}
+                                  onClick={() => setSelectedVoice(v.name)}
+                                  className={`text-left p-2 rounded-xl border text-xs transition cursor-pointer select-none truncate ${
+                                    selectedVoice === v.name
+                                      ? "bg-[#833AB4]/5 border-[#833AB4] text-[#833AB4] font-bold"
+                                      : "bg-white border-gray-200 text-gray-650 hover:bg-gray-50"
+                                  }`}
+                                >
+                                  <span className="block font-bold">{v.label}</span>
+                                  <span className="text-[10px] text-gray-400 block font-normal">{v.desc}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* 2. Slide Meta Details */}
+                          <div className="bg-gray-50 border border-gray-200/80 rounded-xl p-4 space-y-3">
+                            <div>
+                              <span className="block text-[10px] font-bold text-gray-450 uppercase tracking-wide">Scene Narration Script</span>
+                              <p className="text-xs leading-relaxed text-gray-700 mt-1 font-medium">
+                                {generatedScript.slides[activeSlideIndex].voiceoverText}
+                              </p>
+                            </div>
+
+                            <div className="border-t border-gray-200/60 pt-2 flex flex-wrap gap-2 items-center justify-between">
+                              <span className="text-[10px] font-mono text-gray-400">Active Prompt:</span>
+                              <button 
+                                onClick={() => triggerCopyAlert(generatedScript.slides[activeSlideIndex].visualPrompt, `promptext-${activeSlideIndex}`)}
+                                className="text-[9px] text-[#833AB4] font-bold flex items-center gap-0.5 hover:underline"
+                              >
+                                {copiedText === `promptext-${activeSlideIndex}` ? <Check className="w-2.5 h-2.5 text-emerald-600" /> : <Copy className="w-2.5 h-2.5" />}
+                                <span>Copy Scene Prompt</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* 3. Audio Triggers & Quick Simulation Utilities */}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => playSlideAudio(activeSlideIndex)}
+                              disabled={isTtsLoading[activeSlideIndex]}
+                              className="flex-1 bg-purple-50 text-[#833AB4] hover:bg-purple-100 border border-purple-200 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2 text-xs select-none cursor-pointer"
+                            >
+                              {isTtsLoading[activeSlideIndex] ? (
+                                <>
+                                  <RefreshCw className="w-4 h-4 animate-spin animate-spin-slow" />
+                                  <span>Generating audio...</span>
+                                </>
+                              ) : currentlyPlayingIndex === activeSlideIndex ? (
+                                <>
+                                  <Pause className="w-4 h-4" />
+                                  <span>Replay Audio</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Volume2 className="w-4 h-4" />
+                                  <span>Speak This Scene</span>
+                                </>
+                              )}
+                            </button>
+
+                            <button
+                              disabled={isGeneratingImage[activeSlideIndex]}
+                              onClick={() => generateSlideImage(activeSlideIndex)}
+                              className="bg-white hover:bg-gray-50 border border-gray-200 py-3 px-4 rounded-xl font-bold text-gray-700 transition flex items-center justify-center gap-2 text-xs select-none cursor-pointer"
+                              title="Create visual backdrop using Gemini AI representation model"
+                            >
+                              {isGeneratingImage[activeSlideIndex] ? (
+                                <RefreshCw className="w-4 h-4 animate-spin text-[#833AB4]" />
+                              ) : (
+                                <ImageIcon className="w-4 h-4 text-purple-600" />
+                              )}
+                              <span>AI Artwork</span>
+                            </button>
+                          </div>
+
+                          {/* Video player carousel actions */}
+                          <div className="flex justify-between items-center bg-gray-50/50 p-2 border border-gray-200 rounded-xl">
+                            <button 
+                              onClick={() => {
+                                stopVideoAutoplay();
+                                setActiveSlideIndex(p => Math.max(0, p - 1));
+                              }}
+                              disabled={activeSlideIndex === 0}
+                              className="text-[11px] font-bold text-gray-650 hover:bg-white p-2 rounded-lg disabled:opacity-35 transition flex items-center gap-1 select-none cursor-pointer border border-transparent hover:border-gray-200"
+                            >
+                              <ChevronLeft className="w-3.5 h-3.5" />
+                              <span>Prev Scene</span>
+                            </button>
+
+                            <div className="flex gap-1">
+                              {generatedScript.slides.map((_, i) => (
+                                <div 
+                                  key={i} 
+                                  onClick={() => {
+                                    stopVideoAutoplay();
+                                    setActiveSlideIndex(i);
+                                  }}
+                                  className={`w-1.5 h-1.5 rounded-full cursor-pointer transition-all ${
+                                    i === activeSlideIndex ? "bg-[#833AB4] scale-125" : "bg-gray-300"
+                                  }`}
+                                />
+                              ))}
+                            </div>
+
+                            <button 
+                              onClick={() => {
+                                stopVideoAutoplay();
+                                setActiveSlideIndex(p => Math.min(generatedScript.slides.length - 1, p + 1));
+                              }}
+                              disabled={activeSlideIndex === generatedScript.slides.length - 1}
+                              className="text-[11px] font-bold text-gray-650 hover:bg-white p-2 rounded-lg disabled:opacity-35 transition flex items-center gap-1 select-none cursor-pointer border border-transparent hover:border-gray-200"
+                            >
+                              <span>Next Scene</span>
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+
                         </div>
                       </div>
 
-                      {/* Direct narration voiceover */}
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-center">
-                          <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide">Narration / Voiceover Script</span>
-                          <button 
-                            onClick={() => triggerCopyAlert(generatedScript.slides[activeSlideIndex].voiceoverText, `vo-${activeSlideIndex}`)}
-                            className="text-[9px] text-[#833AB4] font-bold flex items-center gap-0.5 hover:underline"
-                          >
-                            {copiedText === `vo-${activeSlideIndex}` ? <Check className="w-2.5 h-2.5 text-emerald-600" /> : <Copy className="w-2.5 h-2.5" />}
-                            <span>Copy Voiceover</span>
-                          </button>
+                      {/* Video Autoplay player console */}
+                      <div className="border-t border-gray-150 pt-5 mt-4 flex flex-col sm:flex-row gap-3 items-center justify-between">
+                        <div className="text-left">
+                          <h4 className="text-xs font-bold text-gray-700 flex items-center gap-1">
+                            <Film className="w-3.5 h-3.5 text-pink-600" />
+                            <span>Cinematic Production Preview</span>
+                          </h4>
+                          <p className="text-[10px] text-gray-400 mt-0.5">Click compile to play the full Shorts narrative sequentially with automated voice-over transitions.</p>
                         </div>
-                        <div className="bg-white border border-gray-200 rounded-lg p-3 text-xs leading-relaxed text-gray-700">
-                          {generatedScript.slides[activeSlideIndex].voiceoverText}
+
+                        <div className="flex gap-2 w-full sm:w-auto">
+                          {isPlayingVideo ? (
+                            <button
+                              onClick={stopVideoAutoplay}
+                              className="flex-1 sm:flex-none bg-[#1E2022] hover:bg-black text-white px-5 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2 text-xs uppercase tracking-wider select-none cursor-pointer border-none"
+                            >
+                              <Pause className="w-4 h-4 text-[#FCAF45]" />
+                              <span>Stop Simulation</span>
+                            </button>
+                          ) : (
+                            <button
+                              onClick={startFullVideoAutoplay}
+                              className="flex-1 sm:flex-none bg-gradient-to-r from-[#833AB4] to-[#F56040] text-white hover:opacity-95 px-5 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2 text-xs uppercase tracking-wider shadow-sm select-none cursor-pointer border-none"
+                            >
+                              <Play className="w-4 h-4 text-white fill-white" />
+                              <span>Play Full Continuous Video</span>
+                            </button>
+                          )}
                         </div>
                       </div>
 
-                      {/* Background Visual prompting suggestions */}
-                      <div className="space-y-1">
-                        <div className="flex justify-between items-center">
-                          <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-wide">AI Image Generator Prompt (9:16)</span>
+                    </div>
+                  )}
+
+                  {/* Tab 2: Detailed full storyboard view listing all scenes */}
+                  {studioTab === "planner" && (
+                    <div className="space-y-6 flex-grow flex flex-col justify-between">
+                      
+                      {/* Suggested Title & Details Card */}
+                      <div className="bg-gradient-to-r from-purple-50 to-pink-50 p-4 rounded-xl border border-purple-100/50">
+                        <div className="flex justify-between items-start mb-2">
+                          <span className="text-[10px] font-bold tracking-wider uppercase text-[#833AB4] font-mono">Suggested Title & Search Metadata</span>
                           <button 
-                            onClick={() => triggerCopyAlert(generatedScript.slides[activeSlideIndex].visualPrompt, `prompt-${activeSlideIndex}`)}
-                            className="text-[9px] text-[#833AB4] font-bold flex items-center gap-0.5 hover:underline"
+                            onClick={() => triggerCopyAlert(`${generatedScript.title}\n\n${generatedScript.description}`, "seo")}
+                            className="text-[10px] text-purple-600 font-bold flex items-center gap-1 hover:underline"
                           >
-                            {copiedText === `prompt-${activeSlideIndex}` ? <Check className="w-2.5 h-2.5 text-emerald-600" /> : <Copy className="w-2.5 h-2.5" />}
-                            <span>Copy Prompt</span>
+                            {copiedText === "seo" ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                            <span>{copiedText === "seo" ? "Copied" : "Copy Title Info"}</span>
                           </button>
                         </div>
-                        <p className="text-[11px] font-mono text-gray-500 bg-[#EAEDF1] p-3 rounded-lg leading-relaxed whitespace-normal break-words shadow-inner select-all">
-                          {generatedScript.slides[activeSlideIndex].visualPrompt}
+                        <h4 className="font-extrabold text-sm text-gray-900 mb-1">
+                          {generatedScript.title}
+                        </h4>
+                        <p className="text-[11px] text-gray-500 italic block leading-relaxed line-clamp-2">
+                          {generatedScript.description}
                         </p>
                       </div>
 
+                      {/* Scene Accordions list */}
+                      <div className="space-y-4 max-h-[420px] overflow-y-auto pr-1">
+                        {generatedScript.slides.map((slide, i) => (
+                          <div 
+                            key={slide.slideId} 
+                            className={`border rounded-xl p-4 transition-all ${
+                              i === activeSlideIndex 
+                                ? "border-[#833AB4] bg-purple-50/10 shadow-xs" 
+                                : "border-gray-200 bg-white"
+                            }`}
+                          >
+                            <div className="flex justify-between items-center pb-2 mb-2 border-b border-gray-100">
+                              <div className="flex items-center gap-2">
+                                <span className="bg-[#833AB4] text-white text-[10px] font-bold px-2 py-0.5 rounded-full font-mono">
+                                  SCENE {i + 1}
+                                </span>
+                                <span className="text-[10px] text-gray-400 font-mono font-bold">⏰ {slide.durationSec}s duration</span>
+                              </div>
+
+                              <div className="flex gap-1.5 items-center">
+                                {/* Individual scene speech player */}
+                                <button
+                                  onClick={() => {
+                                    setActiveSlideIndex(i);
+                                    playSlideAudio(i);
+                                  }}
+                                  disabled={isTtsLoading[i]}
+                                  className="p-1 px-2.5 rounded-lg border text-[10px] font-bold flex items-center gap-1 bg-purple-50 text-[#833AB4] border-purple-150 hover:bg-purple-100 disabled:opacity-40 transition cursor-pointer select-none border-none outline-none"
+                                >
+                                  {isTtsLoading[i] ? (
+                                    <RefreshCw className="w-2.5 h-2.5 animate-spin text-purple-600" />
+                                  ) : currentlyPlayingIndex === i ? (
+                                    <Pause className="w-2.5 h-2.5" />
+                                  ) : (
+                                    <Volume2 className="w-2.5 h-2.5" />
+                                  )}
+                                  <span>{currentlyPlayingIndex === i ? "Playing" : "Listen"}</span>
+                                </button>
+
+                                {/* Individual scene AI background creator */}
+                                <button
+                                  onClick={() => {
+                                    setActiveSlideIndex(i);
+                                    generateSlideImage(i);
+                                  }}
+                                  disabled={isGeneratingImage[i]}
+                                  className="p-1 px-2.5 rounded-lg border text-[10px] font-bold flex items-center gap-1 bg-white hover:bg-gray-50 text-gray-750 border-gray-200 disabled:opacity-40 transition cursor-pointer select-none border-none outline-none"
+                                >
+                                  {isGeneratingImage[i] ? (
+                                    <RefreshCw className="w-2.5 h-2.5 animate-spin text-purple-600" />
+                                  ) : (
+                                    <ImageIcon className="w-2.5 h-2.5 text-purple-600" />
+                                  )}
+                                  <span>{slideImages[i] ? "Regenerate Art" : "Paint Art"}</span>
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-12 gap-3 mt-2 font-sans">
+                              {/* Left Thumbnail visual if generated */}
+                              <div className="md:col-span-3">
+                                {slideImages[i] ? (
+                                  <img 
+                                    src={slideImages[i]} 
+                                    alt={`Visual backdrop Scene ${i+1}`} 
+                                    className="w-full h-20 object-cover rounded-lg border border-gray-200"
+                                    referrerPolicy="no-referrer"
+                                  />
+                                ) : (
+                                  <div className="w-full h-20 bg-gray-50 border border-dashed border-gray-200 rounded-lg flex items-center justify-center text-center p-2">
+                                    <span className="text-[9px] text-gray-400 font-mono leading-tight">No slide custom art</span>
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="md:col-span-9 space-y-2 text-xs">
+                                <div>
+                                  <span className="font-bold text-gray-400 text-[10px] uppercase block">Voiceover Voice:</span>
+                                  <p className="text-gray-700 italic">"{slide.voiceoverText}"</p>
+                                </div>
+                                <div className="bg-gray-50/50 p-2 rounded-lg border border-gray-150 flex justify-between items-center">
+                                  <div className="truncate pr-2">
+                                    <span className="font-bold text-gray-400 text-[9px] uppercase block">Recommended Image Generation Prompt:</span>
+                                    <span className="text-gray-500 font-mono text-[10px] truncate block">{slide.visualPrompt}</span>
+                                  </div>
+                                  <button
+                                    onClick={() => triggerCopyAlert(slide.visualPrompt, `listpmp-${i}`)}
+                                    className="text-[#833AB4] hover:underline flex items-center font-bold text-[10px] shrink-0 bg-transparent border-none"
+                                  >
+                                    {copiedText === `listpmp-${i}` ? <Check className="w-3 h-3 text-emerald-600" /> : <Copy className="w-3 h-3" />}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="bg-slate-50 rounded-xl p-4 border border-gray-200 flex justify-between items-center text-xs">
+                        <span className="text-gray-500 font-mono font-medium">Ready to review all scenes?</span>
+                        <button
+                          onClick={() => setStudioTab("player")}
+                          className="bg-[#1E2022] hover:bg-black text-white px-4 py-2 rounded-lg font-bold text-xs select-none cursor-pointer border-none"
+                        >
+                          Switch to Live Player
+                        </button>
+                      </div>
+
                     </div>
-                  </div>
+                  )}
 
-                  {/* Navigation footer for the script carousel */}
-                  <div className="flex justify-between items-center pt-2 border-t border-gray-100">
-                    <button 
-                      onClick={() => setActiveSlideIndex(p => Math.max(0, p - 1))}
-                      disabled={activeSlideIndex === 0}
-                      className="text-xs font-bold text-gray-650 hover:text-black hover:bg-gray-100 px-3 py-2 rounded-lg border border-gray-200 disabled:opacity-35 transition flex items-center gap-1 select-none cursor-pointer"
-                    >
-                      <ChevronLeft className="w-4 h-4" />
-                      <span>Prev Scene</span>
-                    </button>
-
-                    <div className="flex gap-1.5 justify-center">
-                      {generatedScript.slides.map((_, i) => (
-                        <div 
-                          key={i} 
-                          className={`w-2 h-2 rounded-full transition-all ${
-                            i === activeSlideIndex ? "bg-[#833AB4] w-4" : "bg-gray-200"
-                          }`}
-                        />
-                      ))}
-                    </div>
-
-                    <button 
-                      onClick={() => setActiveSlideIndex(p => Math.min(generatedScript.slides.length - 1, p + 1))}
-                      disabled={activeSlideIndex === generatedScript.slides.length - 1}
-                      className="text-xs font-bold text-gray-650 hover:text-black hover:bg-gray-100 px-3 py-2 rounded-lg border border-gray-200 disabled:opacity-35 transition flex items-center gap-1 select-none cursor-pointer"
-                    >
-                      <span>Next Scene</span>
-                      <ChevronRight className="w-4 h-4" />
-                    </button>
-                  </div>
-                  
                 </div>
               )}
 

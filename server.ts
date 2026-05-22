@@ -2,7 +2,7 @@ import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, Modality } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -518,6 +518,49 @@ app.post("/api/generate-image", async (req, res) => {
     console.warn("Image generation failed or rate limited, falling back to a stunning, curated photography asset matching the scene...");
     const mockPhotoUrl = chooseUnsplashUrl(prompt || "abstract creative background aesthetic design");
     return res.json({ imageUrl: mockPhotoUrl, isFallback: true });
+  }
+});
+
+// Real-time Text-to-Speech endpoint using gemini-3.1-flash-tts-preview
+app.post("/api/generate-tts", async (req, res) => {
+  const { text, voiceName } = req.body;
+  
+  if (!text) {
+    return res.status(400).json({ error: "Text is required for TTS." });
+  }
+
+  const voice = voiceName || "Kore";
+
+  try {
+    if (checkQuotaExhaustion()) {
+      console.info(">> Gemini Quota limit active during TTS. Triggering client-side speech fallback.");
+      return res.json({ useFallbackSpeechSynthesis: true, text });
+    }
+
+    console.info(`>> Generating TTS audio for text using voice ${voice}: "${text.substring(0, 60)}..."`);
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-tts-preview",
+      contents: [{ parts: [{ text: `Say clearly: ${text}` }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: voice },
+          },
+        },
+      },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (base64Audio) {
+      return res.json({ success: true, audio: base64Audio });
+    } else {
+      throw new Error("No audio payload returned from Gemini TTS.");
+    }
+  } catch (error: any) {
+    flagQuotaExhaustion(error);
+    console.warn(">> Gemini TTS failed or rate-limited. Falling back to browser speech synthesis:", error.message || error);
+    return res.json({ useFallbackSpeechSynthesis: true, text });
   }
 });
 
