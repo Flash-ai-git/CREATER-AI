@@ -544,6 +544,44 @@ app.post("/api/generate-image", async (req, res) => {
   }
 });
 
+// Helper function to convert raw PCM audio bytes (24kHz Mono 16-bit LE) to standard WAV format
+function convertPcmToWav(base64Pcm: string, sampleRate = 24000): string {
+  const pcmBuffer = Buffer.from(base64Pcm, "base64");
+  const numChannels = 1;
+  const bitsPerSample = 16;
+  const header = Buffer.alloc(44);
+  
+  // RIFF identifier
+  header.write("RIFF", 0);
+  // file length minus RIFF identifier length and file description length
+  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+  // RIFF type
+  header.write("WAVE", 8);
+  // format chunk identifier
+  header.write("fmt ", 12);
+  // format chunk length
+  header.writeUInt32LE(16, 16);
+  // sample format (raw PCM = 1)
+  header.writeUInt16LE(1, 20);
+  // channel count
+  header.writeUInt16LE(numChannels, 22);
+  // sample rate
+  header.writeUInt32LE(sampleRate, 24);
+  // byte rate (sample rate * block align)
+  header.writeUInt32LE(sampleRate * numChannels * (bitsPerSample / 8), 28);
+  // block align (channel count * bytes per sample)
+  header.writeUInt16LE(numChannels * (bitsPerSample / 8), 32);
+  // bits per sample
+  header.writeUInt16LE(bitsPerSample, 34);
+  // data chunk identifier
+  header.write("data", 36);
+  // data chunk length
+  header.writeUInt32LE(pcmBuffer.length, 40);
+  
+  const wavBuffer = Buffer.concat([header, pcmBuffer]);
+  return wavBuffer.toString("base64");
+}
+
 // Real-time Text-to-Speech endpoint using gemini-3.1-flash-tts-preview
 app.post("/api/generate-tts", async (req, res) => {
   const { text, voiceName, styleName } = req.body;
@@ -593,7 +631,8 @@ app.post("/api/generate-tts", async (req, res) => {
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (base64Audio) {
-      return res.json({ success: true, audio: base64Audio });
+      const wavBase64 = convertPcmToWav(base64Audio, 24000);
+      return res.json({ success: true, audio: wavBase64 });
     } else {
       throw new Error("No audio payload returned from Gemini TTS.");
     }
@@ -601,6 +640,66 @@ app.post("/api/generate-tts", async (req, res) => {
     flagQuotaExhaustion(error);
     console.warn(">> Gemini TTS failed or rate-limited. Falling back to browser speech synthesis:", error.message || error);
     return res.json({ useFallbackSpeechSynthesis: true, text });
+  }
+});
+
+// Compiled video continuous voice-over generator endpoint
+app.post("/api/compiled-voiceover", async (req, res) => {
+  const { slides, voiceName, styleName } = req.body;
+  if (!slides || !Array.isArray(slides) || slides.length === 0) {
+    return res.status(400).json({ error: "Slides are required to compile audio." });
+  }
+
+  // Join the voiceover texts with natural pauses (commas/periods are honored as brief pauses by Gemini TTS)
+  const fullText = slides.map((s: any) => s.voiceoverText.trim()).join(". ");
+
+  const voice = voiceName || "Kore";
+  const style = styleName || "conversational";
+
+  let toneInstruction = "Speak naturally, in a highly conversational, authentic voice with realistic human inflections, warm friendly tone, and breathing pauses. Do not sound robotic or monotone.";
+  if (style === "energetic") {
+    toneInstruction = "Deliver this with high enthusiasm and energy, speaking in an upbeat, fast-paced rhythm suitable for an exciting, highly engaging social media Reels or TikTok host. Flow naturally with human excitement and perfect conversational cadence!";
+  } else if (style === "documentary") {
+    toneInstruction = "Speak as an authoritative, rich-toned narrator. Use measured, dramatic pacing, rich emotional depth, gravitas, and beautifully placed evocative storytelling pauses.";
+  } else if (style === "professional") {
+    toneInstruction = "Speak in a confident, clear, and professional presentation tone. Maintain an articulate, authoritative, yet friendly and highly approachable corporate host cadence.";
+  } else if (style === "friendly") {
+    toneInstruction = "Speak in a very warm, empathetic, reassuring, and pleasant conversational tone with natural melodic rises and falls, sounding like a helpful, close friend.";
+  }
+
+  const formattedTtsPrompt = `Say this fluidly as a continuous, unified short-form video narrative voiceover with perfect human-like pacing and natural storytelling pauses between statements. ${toneInstruction}\n\nText to speak:\n"${fullText}"`;
+
+  try {
+    if (checkQuotaExhaustion()) {
+      console.info(">> Gemini Quota limit active during compiled TTS. Triggering fallback.");
+      return res.json({ useFallbackSpeechSynthesis: true, fullText });
+    }
+
+    console.info(`>> Compiling full TTS audio using voice ${voice} (${style}): "${fullText.substring(0, 100)}..."`);
+    const response = await ai.models.generateContent({
+      model: "gemini-3.1-flash-tts-preview",
+      contents: [{ parts: [{ text: formattedTtsPrompt }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: voice },
+          },
+        },
+      },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (base64Audio) {
+      const wavBase64 = convertPcmToWav(base64Audio, 24000);
+      return res.json({ success: true, audio: wavBase64 });
+    } else {
+      throw new Error("No audio payload returned from Gemini TTS for compiled voiceover.");
+    }
+  } catch (error: any) {
+    flagQuotaExhaustion(error);
+    console.warn(">> Gemini Compiled TTS failed. Falling back.", error.message || error);
+    return res.json({ useFallbackSpeechSynthesis: true, fullText });
   }
 });
 

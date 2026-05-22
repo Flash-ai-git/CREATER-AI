@@ -53,6 +53,12 @@ export default function App() {
   // Feedback alerts
   const [copiedText, setCopiedText] = useState<string | null>(null);
 
+  // Autopilot specific state machine
+  const [isAutopilotRunning, setIsAutopilotRunning] = useState(false);
+  const [autopilotStep, setAutopilotStep] = useState<"idle" | "extracting" | "writing" | "synthesizing" | "complete" | "failed">("idle");
+  const [autopilotError, setAutopilotError] = useState<string | null>(null);
+  const [compiledAudioBase64, setCompiledAudioBase64] = useState<string | null>(null);
+
   // Cleanup synthesizer actions on element unmount
   useEffect(() => {
     return () => {
@@ -321,7 +327,7 @@ export default function App() {
           }
         });
       } else if (data.audio) {
-        const dataUrl = `data:audio/mp3;base64,${data.audio}`;
+        const dataUrl = `data:audio/wav;base64,${data.audio}`;
         setSlideAudio(prev => ({ ...prev, [cacheKey]: dataUrl }));
         triggerAudioElement(dataUrl);
       } else {
@@ -409,11 +415,168 @@ export default function App() {
     setIsPlayingVideo(false);
     setCurrentlyPlayingIndex(null);
     setIsFallbackSpeech(false);
+    setIsAutopilotRunning(false);
+    setAutopilotStep("idle");
+    setAutopilotError(null);
+    setCompiledAudioBase64(null);
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
     }
     window.speechSynthesis.cancel();
+  };
+
+  const downloadTxtMetadata = () => {
+    if (!generatedScript) return;
+    const content = `======================================================
+SHORT-FORM VIDEO METADATA BUNDLE
+======================================================
+
+--- ORIGINAL EXTRACTED TEXT FROM POST ---
+${extractedText || "No source text extracted."}
+
+--- SUGGESTED VIDEO TITLE ---
+${generatedScript.title}
+
+--- SUGGESTED VIDEO DESCRIPTION & HASHTAGS ---
+${generatedScript.description}
+
+--- SCENE-BY-SCENE Storyboard SCRIPT ---
+${generatedScript.slides.map((s, i) => `
+Scene ${i + 1} (Duration: ${s.durationSec}s)
+Caption Overlay: "${s.captionText}"
+Narration Voiceover: "${s.voiceoverText}"
+Visual Prompt Description: "${s.visualPrompt}"
+`).join("\n")}
+
+======================================================
+Generated via Creator-AI Short-Form Studio
+======================================================`;
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${generatedScript.title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-metadata.txt`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadMp3Voiceover = () => {
+    if (!compiledAudioBase64 || compiledAudioBase64 === "fallback") {
+      alert("No pre-rendered voiceover data available in fallback state. Please play/simulate in individual slide modes or copy scripts directly.");
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = compiledAudioBase64;
+    link.download = `${generatedScript?.title.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-voiceover.wav`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleAutopilotPipeline = async (linkToProcess?: string) => {
+    const targetLink = (linkToProcess || instagramUrl).trim();
+    if (!targetLink) {
+      setAutopilotError("Please enter an Instagram post link first.");
+      alert("Please enter an Instagram post link first.");
+      return;
+    }
+
+    setIsAutopilotRunning(true);
+    setAutopilotStep("extracting");
+    setAutopilotError(null);
+    setCompiledAudioBase64(null);
+    setGeneratedScript(null);
+
+    let finalExtractedText = "";
+    
+    try {
+      // 1. Download & OCR text on image
+      console.info(">> Autopilot Step 1: Running OCR/Image extraction on ", targetLink);
+      const extractRes = await fetch("/api/analyze-post", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          images: [],
+          instagramUrl: targetLink,
+          manualPostText: ""
+        })
+      });
+
+      if (!extractRes.ok) {
+        const errData = await extractRes.json();
+        throw new Error(errData.error || "Failed to download image or extract text from post.");
+      }
+
+      const extractData = await extractRes.json();
+      if (extractData.imageUrl) {
+        setDownloadedImageUrl(extractData.imageUrl);
+      }
+      if (extractData.extractedText) {
+        setExtractedText(extractData.extractedText);
+        finalExtractedText = extractData.extractedText;
+      } else {
+        throw new Error("No readable text could be obtained from the post.");
+      }
+
+      // 2. Generate script using the visual text
+      setAutopilotStep("writing");
+      console.info(">> Autopilot Step 2: Generating script on text:", finalExtractedText);
+      const scriptRes = await fetch("/api/generate-script", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          extractedText: finalExtractedText,
+          customGoal: customGoal.trim()
+        })
+      });
+
+      if (!scriptRes.ok) {
+        throw new Error("Could not construct structured short video script.");
+      }
+
+      const scriptData: ScriptResponse = await scriptRes.json();
+      setGeneratedScript(scriptData);
+      setActiveSlideIndex(0);
+
+      // 3. Synthesize entire continuous voiceover narration
+      setAutopilotStep("synthesizing");
+      console.info(">> Autopilot Step 3: Compiling full continuous voice-over audio");
+      const ttsRes = await fetch("/api/compiled-voiceover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          slides: scriptData.slides,
+          voiceName: selectedVoice,
+          styleName: selectedSpeechStyle
+        })
+      });
+
+      if (!ttsRes.ok) {
+        throw new Error("Vocal synthesis route failed during compilation.");
+      }
+
+      const ttsData = await ttsRes.json();
+      if (ttsData.useFallbackSpeechSynthesis) {
+        setCompiledAudioBase64("fallback");
+        console.warn(">> TTS quota limit active; fallback text-to-speech loaded.");
+      } else if (ttsData.audio) {
+        setCompiledAudioBase64(`data:audio/wav;base64,${ttsData.audio}`);
+      } else {
+        throw new Error("Vocal audio synthesis failed.");
+      }
+
+      setAutopilotStep("complete");
+    } catch (err: any) {
+      console.error("Autopilot pipeline failed:", err);
+      setAutopilotError(err.message || "An unexpected issue occurred in the automated media pipeline.");
+      setAutopilotStep("failed");
+    } finally {
+      setIsAutopilotRunning(false);
+    }
   };
 
   const [studioTab, setStudioTab] = useState<"player" | "planner">("player");
@@ -458,6 +621,258 @@ export default function App() {
           <p className="leading-relaxed">
             <strong>How it works:</strong> Paste any Instagram post URL. The system downloads the actual photo directly, completely ignores the external comment caption/metadata, reads text written <strong>on the image itself</strong>, and uses that text to draft custom video scripts. If a direct link scraper gets restricted, you can drag-and-drop a screenshot instead!
           </p>
+        </div>
+
+        {/* Core Description / Disclaimer info */}
+        <div className="bg-[#EEF1F6] border border-gray-200 rounded-2xl p-4 mb-8 flex gap-3 text-xs text-[#4A5568]">
+          <HelpCircle className="w-5 h-5 text-[#833AB4] flex-shrink-0 mt-0.5" />
+          <p className="leading-relaxed">
+            <strong>How it works:</strong> Paste any Instagram post URL. The system downloads the actual photo directly, completely ignores the external comment caption/metadata, reads text written <strong>on the image itself</strong>, and uses that text to draft custom video scripts. If a direct link scraper gets restricted, you can drag-and-drop a screenshot instead!
+          </p>
+        </div>
+
+        {/* =============================================================== */}
+        {/* AUTOPILOT MASTER CONTROL CENTER */}
+        {/* =============================================================== */}
+        <div className="mb-10 bg-white border border-[#E2E8F0] shadow-[0_4px_24px_rgba(0,0,0,0.03)] rounded-3xl p-6 md:p-8 space-y-6">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-gray-100 pb-5">
+            <div className="flex items-center gap-3">
+              <div className="bg-[#833AB4] text-white p-3 rounded-2xl shadow-sm">
+                <Sparkles className="w-6 h-6 text-yellow-300 animate-pulse" />
+              </div>
+              <div>
+                <h2 className="text-lg font-black text-[#1E2022] flex items-center gap-2">
+                  <span>Creator-AI Autopilot Studio</span>
+                  <span className="text-[10px] bg-purple-50 text-purple-600 font-mono font-bold px-2.5 py-0.5 rounded-full border border-purple-100 uppercase tracking-wider">Default Active</span>
+                </h2>
+                <p className="text-xs text-gray-400 mt-1">One-click automation: Extract photo Text → Draft Script → Compile Natural voiceover MP3 & hashtags</p>
+              </div>
+            </div>
+            {generatedScript && (
+              <button 
+                onClick={clearAll}
+                className="self-start md:self-auto text-xs text-rose-500 font-bold border border-rose-100 hover:bg-rose-50 px-3 py-1.5 rounded-xl transition"
+              >
+                Clear / Reset Board
+              </button>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-end">
+            {/* Input Link Bar */}
+            <div className="lg:col-span-6 space-y-2">
+              <label htmlFor="autopilot_link" className="block text-xs font-bold text-gray-500 uppercase tracking-widest font-mono">Instagram Post URL:</label>
+              <div className="relative">
+                <input 
+                  id="autopilot_link"
+                  type="url"
+                  placeholder="https://www.instagram.com/p/..."
+                  value={instagramUrl}
+                  onChange={(e) => setInstagramUrl(e.target.value)}
+                  disabled={isAutopilotRunning}
+                  className="w-full bg-gray-50 border border-gray-250 focus:border-[#833AB4] focus:bg-white focus:ring-1 focus:ring-[#833AB4] pr-4 pl-11 py-3.5 text-sm transition outline-none rounded-2xl placeholder-gray-400 font-semibold text-gray-800"
+                />
+                <div className="absolute left-4 top-1/2 -translate-y-1/2">
+                  <Instagram className="w-5 h-5 text-[#833AB4]" />
+                </div>
+              </div>
+            </div>
+
+            {/* Voice Pick */}
+            <div className="lg:col-span-3 space-y-2">
+              <label htmlFor="autopilot_voice" className="block text-xs font-bold text-gray-500 uppercase tracking-widest font-mono">Profile Voice Style:</label>
+              <select
+                id="autopilot_voice"
+                value={selectedVoice}
+                onChange={(e) => setSelectedVoice(e.target.value)}
+                disabled={isAutopilotRunning}
+                className="w-full bg-gray-50 border border-gray-250 py-3.5 px-4 text-xs font-bold rounded-2xl outline-none focus:ring-1 focus:ring-[#833AB4] text-gray-700 cursor-pointer"
+              >
+                <option value="Kore">♀ Kore (Clean & Crisp)</option>
+                <option value="Zephyr">♀ Zephyr (Cheerful & Friendly)</option>
+                <option value="Puck">♂ Puck (Warm & Enthusiastic)</option>
+                <option value="Fenrir">♂ Fenrir (Energetic Reels Vibe)</option>
+                <option value="Charon">♂ Charon (Serious Narrator)</option>
+              </select>
+            </div>
+
+            {/* Tone Pick */}
+            <div className="lg:col-span-3 space-y-2">
+              <label htmlFor="autopilot_tone" className="block text-xs font-bold text-gray-500 uppercase tracking-widest font-mono">Narrator Vibe Tone:</label>
+              <select
+                id="autopilot_tone"
+                value={selectedSpeechStyle}
+                onChange={(e) => setSelectedSpeechStyle(e.target.value)}
+                disabled={isAutopilotRunning}
+                className="w-full bg-gray-50 border border-gray-250 py-3.5 px-4 text-xs font-bold rounded-2xl outline-none focus:ring-1 focus:ring-[#833AB4] text-gray-700 cursor-pointer"
+              >
+                <option value="conversational">🗣️ Conversational (Conversational, realistic pauses)</option>
+                <option value="friendly">🤗 Friendly (Warm, empathetic, friendly)</option>
+                <option value="energetic">⚡ Energetic (Fast-paced high tempo social host)</option>
+                <option value="documentary">🎙️ Storyteller (Measured documentary narration)</option>
+                <option value="professional">👔 Official (Confident professional host)</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Autopilot Activation Button */}
+          {!generatedScript && !isAutopilotRunning && (
+            <button
+              onClick={() => handleAutopilotPipeline()}
+              className="w-full bg-gradient-to-r from-[#833AB4] via-[#F56040] to-[#FCAF45] hover:brightness-105 active:scale-[0.99] text-white py-4.5 rounded-2xl font-black transition flex items-center justify-center gap-3 text-sm uppercase tracking-widest select-none shadow-md shadow-[#F56040]/10 cursor-pointer border-none"
+            >
+              <Sparkles className="w-5 h-5 text-white" />
+              <span>⚡ Generate Voiceover Bundle & Metadata</span>
+            </button>
+          )}
+
+          {/* Pipeline Loader / Stepper */}
+          {isAutopilotRunning && (
+            <div className="bg-gray-50 border border-purple-100 rounded-2xl p-6 space-y-5">
+              <div className="flex items-center gap-3">
+                <RefreshCw className="w-5 h-5 animate-spin text-[#833AB4]" />
+                <span className="text-xs font-black text-gray-700 uppercase tracking-wider font-mono">Master Autopilot Running...</span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                {[
+                  { step: "extracting", title: "1. Post OCR", label: "Downloading and reading..." },
+                  { step: "writing", title: "2. Scriptwriting", label: "Structuring storyboard..." },
+                  { step: "synthesizing", title: "3. Human TTS", label: "Synthesizing vocal cadence..." },
+                  { step: "complete", title: "4. Finished", label: "Compiling downloads..." }
+                ].map((item, idx) => {
+                  let isCurrent = autopilotStep === item.step;
+                  let isPast = false;
+                  if (autopilotStep === "writing" && idx < 1) isPast = true;
+                  if (autopilotStep === "synthesizing" && idx < 2) isPast = true;
+                  if (autopilotStep === "complete" && idx < 3) isPast = true;
+                  
+                  return (
+                    <div 
+                      key={idx} 
+                      className={`border rounded-xl p-3.5 transition-all text-left ${
+                        isPast 
+                          ? "border-emerald-250 bg-emerald-50/50" 
+                          : isCurrent 
+                          ? "border-[#833AB4] bg-purple-50/20 shadow-xs" 
+                          : "border-gray-200 bg-white"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[10px] font-extrabold uppercase tracking-widest font-mono text-gray-400">{item.title}</span>
+                        {isPast ? (
+                          <span className="text-emerald-600 text-xs font-bold">✓ Done</span>
+                        ) : isCurrent ? (
+                          <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-purple-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-[#833AB4]"></span>
+                          </span>
+                        ) : null}
+                      </div>
+                      <span className={`text-xs font-extrabold truncate block ${isPast ? "text-emerald-700" : isCurrent ? "text-purple-950 font-bold" : "text-gray-450"}`}>
+                        {isCurrent ? item.label : isPast ? "Done" : "Waiting"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Autopilot Error block */}
+          {autopilotError && (
+            <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs text-rose-800 font-semibold">
+              ⚠️ Operation Failed: {autopilotError}
+            </div>
+          )}
+
+          {/* Autopilot Delivery Center */}
+          {compiledAudioBase64 && autopilotStep === "complete" && (
+            <div className="border-2 border-emerald-500 rounded-2xl overflow-hidden shadow-lg animate-fade-in">
+              <div className="bg-gradient-to-r from-emerald-500 to-teal-500 p-5 text-white flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <Sparkles className="w-5 h-5 animate-bounce text-yellow-300" />
+                  <div>
+                    <span className="text-[9px] uppercase font-bold tracking-widest font-mono bg-white/20 px-2.5 py-0.5 rounded-full">Pipeline Succeeded</span>
+                    <h3 className="font-extrabold text-sm mt-1">Ready for Reels/TikTok Production!</h3>
+                  </div>
+                </div>
+                <div className="text-[10px] font-mono bg-black/25 px-2.5 py-1 rounded-md font-bold">
+                  ⚡ Autopilot Mode Complete
+                </div>
+              </div>
+
+              <div className="p-6 space-y-6 bg-white text-left">
+                {/* Continuous Audio Player */}
+                <div className="bg-gradient-to-br from-indigo-50/50 to-purple-50/50 border border-purple-100 p-5 rounded-2xl space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-purple-100 pb-3">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2.5 bg-indigo-600 rounded-xl text-white shadow-xs">
+                        <Headphones className="w-5 h-5 text-white animate-pulse" />
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold text-[#833AB4] uppercase tracking-wide font-mono block">Voiceover Player</span>
+                        <h4 className="font-extrabold text-[#1E2022] text-sm mt-0.5">Continuous Voiceover File</h4>
+                      </div>
+                    </div>
+                    <span className="text-xs bg-indigo-50 text-[#833AB4] font-mono px-3 py-1 rounded-full font-bold self-start sm:self-auto border border-indigo-150">
+                      Narrator: {selectedVoice} style ({selectedSpeechStyle})
+                    </span>
+                  </div>
+
+                  {compiledAudioBase64 !== "fallback" ? (
+                    <div className="bg-white p-3.5 rounded-xl border border-purple-200/50 shadow-xs flex flex-col sm:flex-row items-center gap-4">
+                      <span className="text-[11px] text-gray-400 font-mono shrink-0">Continuous Audio:</span>
+                      <audio controls src={compiledAudioBase64} className="w-full flex-1 h-10 outline-none" />
+                    </div>
+                  ) : (
+                    <div className="bg-amber-50 border border-amber-200 p-4 rounded-xl text-amber-850 text-xs flex gap-3 leading-relaxed">
+                      <Volume2 className="w-5 h-5 text-amber-600 shrink-0" />
+                      <div>
+                        <p className="font-bold">TTS Model fallback activated</p>
+                        <p className="mt-0.5">You can play individual storyboard slides seamlessly inside the interactive smartphone player simulation below. Please obtain your structured metadata script document package directly using the black button below!</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Dynamic Autopilot Downloads */}
+                  <div className="flex flex-col sm:flex-row gap-3 pt-2">
+                    {compiledAudioBase64 !== "fallback" && (
+                      <button
+                        onClick={downloadMp3Voiceover}
+                        className="flex-1 uppercase tracking-widest text-xs font-bold font-sans flex items-center justify-center gap-2 bg-[#833AB4] hover:bg-[#6c2899] text-white py-4 rounded-xl transition shadow-sm cursor-pointer select-none border-none outline-none"
+                      >
+                        <Download className="w-4.5 h-4.5 text-white" />
+                        <span>Download Voiceover (WAV)</span>
+                      </button>
+                    )}
+
+                    <button
+                      onClick={downloadTxtMetadata}
+                      className="flex-1 uppercase tracking-widest text-xs font-bold font-sans flex items-center justify-center gap-2 bg-[#1E2022] hover:bg-black text-white py-4 rounded-xl transition shadow-sm cursor-pointer select-none border-none outline-none"
+                    >
+                      <FileText className="w-4.5 h-4.5 text-yellow-300" />
+                      <span>Download Metadata text bundle (TXT)</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Previews */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                  <div className="border border-gray-150 rounded-2xl p-5 bg-gray-50/50">
+                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block font-mono mb-2">Shorts suggested SEO Title</span>
+                    <p className="font-extrabold text-sm text-gray-900 leading-snug">{generatedScript?.title}</p>
+                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block font-mono mt-4 mb-2">Hashtags & Description</span>
+                    <p className="text-xs text-gray-500 italic block leading-relaxed line-clamp-3">{generatedScript?.description}</p>
+                  </div>
+                  <div className="border border-gray-150 rounded-2xl p-5 bg-gray-50/50">
+                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block font-mono mb-2">Insta extracted raw text</span>
+                    <p className="text-xs text-gray-650 leading-relaxed font-mono line-clamp-6 bg-white p-3 rounded-lg border border-gray-200">{extractedText}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
