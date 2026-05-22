@@ -523,13 +523,30 @@ app.post("/api/generate-image", async (req, res) => {
 
 // Real-time Text-to-Speech endpoint using gemini-3.1-flash-tts-preview
 app.post("/api/generate-tts", async (req, res) => {
-  const { text, voiceName } = req.body;
+  const { text, voiceName, styleName } = req.body;
   
   if (!text) {
     return res.status(400).json({ error: "Text is required for TTS." });
   }
 
   const voice = voiceName || "Kore";
+  const style = styleName || "conversational";
+
+  // Build high-fidelity natural speech guidelines dynamically depending on requested tone
+  let toneInstruction = "Speak naturally, in a highly conversational, authentic voice with realistic human inflections, warm friendly tone, and breathing pauses. Do not sound robotic or monotone.";
+  
+  if (style === "energetic") {
+    toneInstruction = "Deliver this with high enthusiasm and energy, speaking in an upbeat, fast-paced rhythm suitable for an exciting, highly engaging social media Reels or TikTok host. Flow naturally with human excitement and perfect conversational cadence!";
+  } else if (style === "documentary") {
+    toneInstruction = "Speak as an authoritative, rich-toned narrator. Use measured, dramatic pacing, rich emotional depth, gravitas, and beautifully placed evocative storytelling pauses.";
+  } else if (style === "professional") {
+    toneInstruction = "Speak in a confident, clear, and professional presentation tone. Maintain an articulate, authoritative, yet friendly and highly approachable corporate host cadence.";
+  } else if (style === "friendly") {
+    toneInstruction = "Speak in a very warm, empathetic, reassuring, and pleasant conversational tone with natural melodic rises and falls, sounding like a helpful, close friend.";
+  }
+
+  // Combine instructions into a powerful prompt directive for gemini-3.1-flash-tts-preview
+  const formattedTtsPrompt = `Say this in a perfectly natural, highly realistic, organic human-like delivery. ${toneInstruction}\n\nText to speak:\n"${text}"`;
 
   try {
     if (checkQuotaExhaustion()) {
@@ -537,10 +554,10 @@ app.post("/api/generate-tts", async (req, res) => {
       return res.json({ useFallbackSpeechSynthesis: true, text });
     }
 
-    console.info(`>> Generating TTS audio for text using voice ${voice}: "${text.substring(0, 60)}..."`);
+    console.info(`>> Generating TTS audio using voice ${voice} (${style}): "${text.substring(0, 60)}..."`);
     const response = await ai.models.generateContent({
       model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text: `Say clearly: ${text}` }] }],
+      contents: [{ parts: [{ text: formattedTtsPrompt }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {

@@ -39,6 +39,7 @@ export default function App() {
 
   // Text-To-Speech & Video Simulation states
   const [selectedVoice, setSelectedVoice] = useState("Kore"); // Kore, Zephyr, Puck, Fenrir, Charon
+  const [selectedSpeechStyle, setSelectedSpeechStyle] = useState("conversational"); // conversational, energetic, documentary, professional, friendly
   const [slideImages, setSlideImages] = useState<Record<number, string>>({});
   const [isGeneratingImage, setIsGeneratingImage] = useState<Record<number, boolean>>({});
   const [isTtsLoading, setIsTtsLoading] = useState<Record<number, boolean>>({});
@@ -283,7 +284,7 @@ export default function App() {
     };
 
     // Voice Cache Lookup
-    const cacheKey = `${index}-${selectedVoice}`;
+    const cacheKey = `${index}-${selectedVoice}-${selectedSpeechStyle}`;
     if (slideAudio[cacheKey]) {
       triggerAudioElement(slideAudio[cacheKey]);
       return;
@@ -297,7 +298,8 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           text: slide.voiceoverText,
-          voiceName: selectedVoice
+          voiceName: selectedVoice,
+          styleName: selectedSpeechStyle
         })
       });
 
@@ -403,6 +405,7 @@ export default function App() {
     setSlideImages({});
     setSlideAudio({});
     setSelectedVoice("Kore");
+    setSelectedSpeechStyle("conversational");
     setIsPlayingVideo(false);
     setCurrentlyPlayingIndex(null);
     setIsFallbackSpeech(false);
@@ -856,29 +859,61 @@ export default function App() {
                         <div className="md:col-span-6 space-y-4">
                           
                           {/* 1. Voice Selector Block */}
-                          <div className="space-y-2">
-                            <span className="block text-[11px] font-bold text-gray-400 uppercase tracking-widest font-mono">Gemini AI Model Voice</span>
-                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-1.5">
-                              {[
-                                { name: "Kore", label: "♀ Kore", desc: "Clear Female" },
-                                { name: "Zephyr", label: "♀ Zephyr", desc: "Cheerful" },
-                                { name: "Puck", label: "♂ Puck", desc: "Warm Male" },
-                                { name: "Fenrir", label: "♂ Fenrir", desc: "Energetic" },
-                                { name: "Charon", label: "♂ Charon", desc: "Serious Male" }
-                              ].map((v) => (
-                                <button
-                                  key={v.name}
-                                  onClick={() => setSelectedVoice(v.name)}
-                                  className={`text-left p-2 rounded-xl border text-xs transition cursor-pointer select-none truncate ${
-                                    selectedVoice === v.name
-                                      ? "bg-[#833AB4]/5 border-[#833AB4] text-[#833AB4] font-bold"
-                                      : "bg-white border-gray-200 text-gray-650 hover:bg-gray-50"
-                                  }`}
-                                >
-                                  <span className="block font-bold">{v.label}</span>
-                                  <span className="text-[10px] text-gray-400 block font-normal">{v.desc}</span>
-                                </button>
-                              ))}
+                          <div className="space-y-4">
+                            <div className="space-y-2">
+                              <span className="block text-[11px] font-bold text-gray-400 uppercase tracking-widest font-mono">Gemini AI Model Voice</span>
+                              <div className="grid grid-cols-2 lg:grid-cols-5 gap-1.55">
+                                {[
+                                  { name: "Kore", label: "♀ Kore", desc: "Clear" },
+                                  { name: "Zephyr", label: "♀ Zephyr", desc: "Cheerful" },
+                                  { name: "Puck", label: "♂ Puck", desc: "Warm" },
+                                  { name: "Fenrir", label: "♂ Fenrir", desc: "Energetic" },
+                                  { name: "Charon", label: "♂ Charon", desc: "Serious" }
+                                ].map((v) => (
+                                  <button
+                                    key={v.name}
+                                    onClick={() => setSelectedVoice(v.name)}
+                                    className={`text-left p-2 rounded-xl border text-xs transition cursor-pointer select-none truncate ${
+                                      selectedVoice === v.name
+                                        ? "bg-[#833AB4]/5 border-[#833AB4] text-[#833AB4] font-bold"
+                                        : "bg-white border-gray-200 text-gray-650 hover:bg-gray-50"
+                                    }`}
+                                  >
+                                    <span className="block font-bold">{v.label}</span>
+                                    <span className="text-[10px] text-gray-400 block font-normal">{v.desc}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="space-y-2">
+                              <div className="flex justify-between items-center">
+                                <span className="block text-[11px] font-bold text-gray-400 uppercase tracking-widest font-mono">Speech Tone & Vibe</span>
+                                <span className="text-[10px] bg-indigo-50 text-[#833AB4] font-mono px-2.5 py-0.5 rounded-full font-bold">Natural Speaking Modulator</span>
+                              </div>
+                              <div className="grid grid-cols-2 lg:grid-cols-5 gap-1.5">
+                                {[
+                                  { name: "conversational", label: "Conversational", emoji: "🗣️", desc: "Natural, realistic pauses" },
+                                  { name: "friendly", label: "Warm Friendly", emoji: "🤗", desc: "Empathetic, pleasant" },
+                                  { name: "energetic", label: "Energetic Host", emoji: "⚡", desc: "Fast-paced Reels style" },
+                                  { name: "documentary", label: "Narrator Vibe", emoji: "🎙️", desc: "Measured, storytelling" },
+                                  { name: "professional", label: "Official Host", emoji: "👔", desc: "Confident, executive" }
+                                ].map((s) => (
+                                  <button
+                                    key={s.name}
+                                    onClick={() => setSelectedSpeechStyle(s.name)}
+                                    className={`text-left p-2 rounded-xl border text-[11px] transition cursor-pointer select-none ${
+                                      selectedSpeechStyle === s.name
+                                        ? "bg-indigo-50 border-indigo-500 text-indigo-700 font-bold"
+                                        : "bg-white border-gray-200 text-gray-650 hover:bg-gray-50"
+                                    }`}
+                                    title={s.desc}
+                                  >
+                                    <span className="block font-bold truncate">{s.emoji} {s.label}</span>
+                                    <span className="text-[9px] text-gray-400 block font-normal line-clamp-1 truncate">{s.desc}</span>
+                                  </button>
+                                ))}
+                              </div>
                             </div>
                           </div>
 
