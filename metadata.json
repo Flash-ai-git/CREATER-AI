@@ -1,0 +1,6 @@
+{
+  "name": "Social Video Creator",
+  "description": "Download high-resolution photos and extract exact caption text from Instagram links.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
