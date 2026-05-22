@@ -13,6 +13,25 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = 3000;
 
+// CORS configuration to allow Render server and standard dev environments
+app.use((req, res, next) => {
+  const allowedOrigins = ["https://creater-ai-wmn2.onrender.com", "http://localhost:3000", "http://localhost:5173"];
+  const origin = req.headers.origin;
+  if (origin && (allowedOrigins.includes(origin) || origin.endsWith(".onrender.com"))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (!origin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, PUT, PATCH, POST, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
 // Increase body limit to handle large base64 uploads
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
